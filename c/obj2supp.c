@@ -204,7 +204,17 @@ static unsigned CalcSavedFixSize( fix_type fixtype )
     } else {
         retval = sizeof( save_fixup ) + CalcAddendSize( fixtype );
         if( FRAME_HAS_DATA( FIX_GET_FRAME( fixtype ) ) ) {
-            retval += sizeof( unsigned_32 );
+            /*
+                The saved relocation stream stores an extra frame payload
+                immediately after save_fixup when FRAME_HAS_DATA() is true.
+                That payload is later read in IncExecRelocs() as a pointer
+                (see: frame.u.ptr = *((void **)( save + 1 ));).
+
+                On 64-bit targets, saving only 4 bytes here desynchronizes
+                record walking (IterateModRelocs) and can make IncExecRelocs
+                receive a bogus save_fixup pointer, leading to a crash.
+            */
+            retval += sizeof( void * );
         }
     }
     return( retval );
@@ -433,13 +443,33 @@ unsigned IncExecRelocs( void *_save )
     frame_spec  frame;
 
     if( save->flags & FIX_CHANGE_SEG ) {
-        sdata = (segdata *)( save->flags & ~FIX_CHANGE_SEG );
+        /*
+            NOTE about pointer size:
+            FIX_CHANGE_SEG records are stored as a single 32-bit word
+            (see StoreFixup(): PermSaveFixup(&save, sizeof(unsigned_32))).
+            On 64-bit, that cannot hold a segdata*.
+
+            During an incremental relink pass2, those 32-bit records contain
+            a CarveSegData index OR-ed with FIX_CHANGE_SEG, and the current
+            segment can be restored from LastSegData.
+        */
+
+        /*
+            The on-disk/in-memory relocation stream stores FIX_CHANGE_SEG
+            records as 4 bytes. That works on 32-bit (it stored segdata*),
+            but on 64-bit we must *not* attempt to reconstruct a pointer from
+            save->flags.
+        */
+        sdata = LastSegData;
 		DEBUG(( DBG_OLD, "IncExecReloc(): FIX_CHANGE_SEG, off=%h sdata=%h", save->off, sdata ))
         if( LinkFlags & INC_LINK_FLAG ) {
-            save->flags = (unsigned_32) CarveGetIndex( CarveSegData, sdata );
-            save->flags |= FIX_CHANGE_SEG;
+            /* Keep record in index form for future incremental runs */
+            if( sdata != NULL ) {
+                save->flags = (unsigned_32) CarveGetIndex( CarveSegData, sdata );
+                save->flags |= FIX_CHANGE_SEG;
+            }
         }
-        if( !sdata->isdead ) {
+        if( sdata != NULL && !sdata->isdead ) {
             LoadObj( sdata );
             LastSegData = sdata;
         } else {
@@ -562,7 +592,8 @@ void StoreFixup( offset off, fix_type type, frame_spec *frame,
     }
     PermSaveFixup( &save, sizeof( save_fixup ) );
     if( FRAME_HAS_DATA( frame->type ) ) {
-        PermSaveFixup( &frame->u.abs, sizeof( unsigned_32 ) );
+        /* Keep saved stream layout consistent with IncExecRelocs() */
+        PermSaveFixup( &frame->u.ptr, sizeof( void * ) );
     }
     if( !( save.flags & FIX_ADDEND_ZERO ) )  {
         PermSaveFixup( buff, CalcAddendSize( save.flags ) );
